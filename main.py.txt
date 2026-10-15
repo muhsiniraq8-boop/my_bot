@@ -1,0 +1,189 @@
+import asyncio
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+# --- الإعدادات الأساسية ---
+BOT_TOKEN = "8886845641:AAHsM7QKoy916RnwFTTcyt6N1lIwDxqrl0c"
+ADMIN_ID = 7973649336  # ضع آيدي (رقم) حسابك الخاص هنا ليكون مشرف البوت
+CHANNEL_USERNAME = "@q_ep9"  # معرف قناتك مع @
+DELETE_TIME = 100  # وقت الحذف التلقائي بالثواني
+
+# --- إعداد قاعدة البيانات (SQLite) ---
+conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# إنشاء الجداول (جدول للمشتركين وجدول للملفات/الفيديوهات)
+cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id TEXT, file_type TEXT, caption TEXT)''')
+conn.commit()
+
+# --- وظائف قاعدة البيانات والمساعدة ---
+def add_user(user_id):
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+
+def get_all_users():
+    cursor.execute("SELECT user_id FROM users")
+    return [row[0] for row in cursor.fetchall()]
+
+async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except Exception:
+        return False
+
+# --- أمر /start وعرض المحتوى ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    add_user(user_id) # حفظ المشترك في قاعدة البيانات
+
+    # التحقق من الاشتراك الإجباري
+    is_subscribed = await check_subscription(user_id, context)
+    if not is_subscribed:
+        keyboard = [
+            [InlineKeyboardButton("اضغط هنا للدخول للقناة 🦄💙", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"عذراً يجب الدخول الى القناة والضغط على كلمة ( اضغط هنا ) لعرض حزمة الفيديوهات 🦄💙\nالقناة ➡️ {CHANNEL_USERNAME}",
+            reply_markup=reply_markup
+        )
+        return
+
+    # جلب كل الملفات المرفوعة من قاعدة البيانات
+    cursor.execute("SELECT file_id, file_type, caption FROM media")
+    all_media = cursor.fetchall()
+
+    if not all_media:
+        await update.message.reply_text("عذراً، لا توجد حزم فيديوهات مرفوعة حالياً من قبل الآدمن.")
+        return
+
+    # إرسال الفيديوهات/الصور للمستخدم مع مؤقت الحذف
+    for file_id, file_type, caption in all_media:
+        full_caption = f"{caption or ''}\n\n⏱️ يتم الحذف بعد {DELETE_TIME} ثانية...🦄💙"
+        sent_msg = None
+        
+        try:
+            if file_type == 'video':
+                sent_msg = await context.bot.send_video(chat_id=user_id, video=file_id, caption=full_caption)
+            elif file_type == 'photo':
+                sent_msg = await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=full_caption)
+            elif file_type == 'animation': # ملفات GIF
+                sent_msg = await context.bot.send_animation(chat_id=user_id, animation=file_id, caption=full_caption)
+            elif file_type == 'document':
+                sent_msg = await context.bot.send_document(chat_id=user_id, document=file_id, caption=full_caption)
+            
+            # جدولة الحذف التلقائي لكل ملف
+            if sent_msg:
+                asyncio.create_task(delete_after_delay(context, user_id, sent_msg.message_id, DELETE_TIME))
+        except Exception as e:
+            print(f"خطأ في إرسال ملف: {e}")
+
+async def delete_after_delay(context, chat_id, message_id, delay):
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except:
+        pass
+
+# --- لوحة تحكم الآدمن ---
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 إحصائيات المشتركين", callback_data="stats")],
+        [InlineKeyboardButton("📢 إذاعة رسالة (صورة/فيديو/GIF/نص)", callback_data="broadcast_info")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("مرحباً بك في لوحة تحكم الآدمن ⚙️:", reply_markup=reply_markup)
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    await query.answer()
+    if query.data == "stats":
+        users = get_all_users()
+        cursor.execute("SELECT COUNT(*) FROM media")
+        media_count = cursor.fetchone()[0]
+        await query.edit_message_text(f"📊 إحصائيات البوت:\n- عدد المشتركين: {len(users)}\n- عدد المنشورات المخزنة: {media_count}")
+    
+    elif query.data == "broadcast_info":
+        await query.edit_message_text("📢 للإذاعة للمشتركين:\nقم بإرسال (صورة، فيديو، GIF، أو رسالة نصية) إلى البوت وأرفق معها الأمر `/broadcast` في الوصل (Caption) أو النص.")
+
+# --- استقبال المنشورات الجديدة من الآدمن وتخزينها أو إذاعتها ---
+async def handle_admin_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    message = update.message
+    caption = message.caption or message.text or ""
+
+    # نظام الإذاعة
+    if caption.startswith("/broadcast"):
+        actual_text = caption.replace("/broadcast", "").strip()
+        users = get_all_users()
+        sent_count = 0
+        
+        await message.reply_text(f"⏳ جاري بدء الإذاعة إلى {len(users)} مشترك...")
+        for uid in users:
+            try:
+                if message.video:
+                    await context.bot.send_video(chat_id=uid, video=message.video.file_id, caption=actual_text)
+                elif message.photo:
+                    await context.bot.send_photo(chat_id=uid, photo=message.photo.file_id, caption=actual_text)
+                elif message.animation:
+                    await context.bot.send_animation(chat_id=uid, animation=message.animation.file_id, caption=actual_text)
+                elif message.document:
+                    await context.bot.send_document(chat_id=uid, document=message.document.file_id, caption=actual_text)
+                else:
+                    await context.bot.send_message(chat_id=uid, text=actual_text)
+                sent_count += 1
+                await asyncio.sleep(0.1) # لمنع حظر التيليجرام بسبب السرعة
+            except:
+                pass
+        await message.reply_text(f"✅ تمت الإذاعة بنجاح إلى {sent_count} مشترك.")
+        return
+
+    # حفظ المنشورات المتعددة في قاعدة البيانات (فيديوهات، صور، GIF)
+    file_id = None
+    file_type = None
+
+    if message.video:
+        file_id = message.video.file_id
+        file_type = 'video'
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        file_type = 'photo'
+    elif message.animation:
+        file_id = message.animation.file_id
+        file_type = 'animation'
+    elif message.document:
+        file_id = message.document.file_id
+        file_type = 'document'
+
+    if file_id and file_type:
+        cursor.execute("INSERT INTO media (file_id, file_type, caption) VALUES (?, ?, ?)", (file_id, file_type, message.caption))
+        conn.commit()
+        await message.reply_text("✅ تم حفظ الملف بنجاح في قاعدة بيانات البوت ضمن حزمة الفيديوهات!")
+
+# --- تشغيل البوت ---
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CallbackQueryHandler(admin_buttons))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_admin_uploads))
+    
+    print("البوت يعمل بكامل الميزات الآن...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
